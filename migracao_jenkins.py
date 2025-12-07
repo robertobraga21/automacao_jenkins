@@ -61,7 +61,7 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V45 (Home/Cache Fix) ---")
+    print("\n🚀 --- Migração EKS V46 (Helm Repo Fix) ---")
     
     CONFIG['env'] = get_required_env("ENV_TYPE").upper()
     CONFIG['region'] = get_required_env("AWS_REGION")
@@ -293,18 +293,21 @@ def install_velero(context):
     run_shell(f"kubectl config use-context {context}", quiet=True)
     run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True)
     
+    # --- CORREÇÃO: ADICIONA REPO ANTES DE INSTALAR ---
+    run_shell("helm repo add vmware-tanzu https://vmware-tanzu.github.io/helm-charts", quiet=True)
+    run_shell("helm repo update", quiet=True)
+    # ------------------------------------------------
+    
     cmd = f"helm upgrade --install velero vmware-tanzu/velero --namespace velero -f values.yaml --reset-values --wait"
     run_shell(cmd, quiet=True)
     run_shell("kubectl rollout restart deployment velero -n velero", quiet=True)
 
 # --- MAIN ---
 def main():
-    # --- CORREÇÃO DE PERMISSÕES (HOME & KUBECONFIG) ---
-    cwd = os.getcwd()
-    os.environ["HOME"] = cwd  # Corrige erro do Helm/Pip/Cache
-    os.environ["KUBECONFIG"] = os.path.join(cwd, "kube_config") # Corrige erro do K8s lib
-    # --------------------------------------------------
-
+    # Fix para permissões no Jenkins
+    os.environ["HOME"] = os.getcwd()
+    os.environ["KUBECONFIG"] = os.path.join(os.getcwd(), "kube_config")
+    
     load_config()
     
     validate_bucket(CONFIG['bucket_name'])
