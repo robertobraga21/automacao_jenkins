@@ -61,7 +61,7 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V44 (Explicit Kubeconfig Path) ---")
+    print("\n🚀 --- Migração EKS V45 (Home/Cache Fix) ---")
     
     CONFIG['env'] = get_required_env("ENV_TYPE").upper()
     CONFIG['region'] = get_required_env("AWS_REGION")
@@ -189,23 +189,20 @@ def update_trust_policy(role_name, oidc, ns, sa):
 
 def run_pre_flight_irsa(ctx, dest_oidc):
     print(f"\n🕵️  [IRSA] Scan de Aplicações em {ctx}...")
-    
-    # --- CORREÇÃO AQUI: Passamos o config_file explicitamente ---
     try:
         k8s_config.load_kube_config(config_file=os.environ["KUBECONFIG"], context=ctx)
         v1 = client.CoreV1Api()
     except Exception as e:
         print(f"   ⛔ Erro carregando Kubeconfig: {e}")
         sys.exit(1)
-    # ------------------------------------------------------------
 
-    cnt = 0
     try:
         items = v1.list_service_account_for_all_namespaces().items
     except Exception as e:
         print(f"   ⛔ Erro listando ServiceAccounts: {e}")
         return
 
+    cnt = 0
     for sa in items:
         ns = sa.metadata.namespace
         if ns in SYSTEM_NAMESPACES: continue
@@ -233,12 +230,9 @@ def sync_istio_resources(src_ctx, dst_ctx):
     if mode == 'none': return
 
     print(f"\n🕸️  [ISTIO] Sincronizando (Mode: {mode})...")
-    
-    # --- CORREÇÃO AQUI: Passamos o config_file explicitamente ---
     k8s_config.load_kube_config(config_file=os.environ["KUBECONFIG"], context=src_ctx)
     custom_api_src = client.CustomObjectsApi()
-    # ------------------------------------------------------------
-
+    
     ns_ignore_istio = [ns for ns in SYSTEM_NAMESPACES if ns != "istio-system"]
     group = "networking.istio.io"; version = "v1beta1"; plural = "virtualservices"
     
@@ -257,11 +251,8 @@ def sync_istio_resources(src_ctx, dst_ctx):
     if not candidates: print("    ℹ️  Nada para sincronizar."); return
 
     print(f"    📤 Aplicando {len(candidates)} VSs no Destino...")
-    
-    # --- CORREÇÃO AQUI TAMBÉM ---
     k8s_config.load_kube_config(config_file=os.environ["KUBECONFIG"], context=dst_ctx)
     custom_api_dst = client.CustomObjectsApi()
-    # ----------------------------
     
     for body in candidates:
         ns = body['metadata']['namespace']; name = body['metadata']['name']
@@ -308,9 +299,12 @@ def install_velero(context):
 
 # --- MAIN ---
 def main():
-    # Define arquivo local para o Kubeconfig (Evita erro de permissão no /)
-    os.environ["KUBECONFIG"] = os.path.join(os.getcwd(), "kube_config")
-    
+    # --- CORREÇÃO DE PERMISSÕES (HOME & KUBECONFIG) ---
+    cwd = os.getcwd()
+    os.environ["HOME"] = cwd  # Corrige erro do Helm/Pip/Cache
+    os.environ["KUBECONFIG"] = os.path.join(cwd, "kube_config") # Corrige erro do K8s lib
+    # --------------------------------------------------
+
     load_config()
     
     validate_bucket(CONFIG['bucket_name'])
@@ -318,7 +312,6 @@ def main():
     ensure_role_permissions(CONFIG['role_name'])
     generate_velero_values(CONFIG['bucket_name'], CONFIG['role_arn'], CONFIG['region'])
 
-    # Gera o arquivo físico kube_config
     ctx_src = setup_kube_context(CONFIG['cluster_src'])
     ctx_dst = setup_kube_context(CONFIG['cluster_dst'])
 
