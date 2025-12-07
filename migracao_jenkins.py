@@ -61,7 +61,7 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V42 (Jenkins Native) ---")
+    print("\n🚀 --- Migração EKS V43 (Jenkins Permissions Fix) ---")
     
     # Leitura Estrita das Variáveis do Jenkins
     CONFIG['env'] = get_required_env("ENV_TYPE").upper()
@@ -73,7 +73,6 @@ def load_config():
     CONFIG['bucket_name'] = get_required_env("VELERO_BUCKET_NAME")
     CONFIG['role_arn'] = get_required_env("VELERO_ROLE_ARN")
     
-    # Opcionais (com defaults seguros)
     CONFIG['istio_sync_mode'] = os.getenv("ISTIO_SYNC_MODE", "all").lower()
     CONFIG['cleanup'] = os.getenv("CLEANUP_ENABLED", "false").lower() == 'true'
     CONFIG['skip_restore'] = os.getenv("SKIP_RESTORE", "false").lower() == 'true'
@@ -84,7 +83,6 @@ def load_config():
     print(f"   ℹ️  Destino: {CONFIG['cluster_dst']}")
 
 def get_aws_session():
-    # O boto3 pegará as credenciais injetadas pelo Jenkins automaticamente
     return boto3.Session(region_name=CONFIG['region'])
 
 # --- 2. VALIDAÇÃO DE RECURSOS ---
@@ -237,14 +235,13 @@ def sync_istio_resources(src_ctx, dst_ctx):
         if mode == 'all':
             candidates = [sanitize_k8s_object(i) for i in items]
         else:
-            # Filtro por lista de nomes exatos (ex: vs-app,vs-admin)
             target_names = [n.strip() for n in mode.split(',')]
             candidates = [sanitize_k8s_object(i) for i in items if i['metadata']['name'] in target_names]
     except Exception as e: print(f"    ⚠️  Erro leitura Istio: {e}"); return
 
     if not candidates: print("    ℹ️  Nada para sincronizar."); return
 
-    print(f"    📤 Replicando {len(candidates)} VSs no Destino...")
+    print(f"    📤 Aplicando {len(candidates)} VSs no Destino...")
     k8s_config.load_kube_config(context=dst_ctx)
     custom_api_dst = client.CustomObjectsApi()
     
@@ -278,8 +275,9 @@ def cleanup_velero(context):
     print(f"🧹 [CLEANUP] Limpando {context}...")
     run_shell(f"kubectl config use-context {context}", quiet=True)
     run_shell("helm uninstall velero -n velero", ignore_error=True, quiet=True)
+    # Tenta deletar NS e força se necessário (lógica simplificada para headless)
     run_shell("kubectl delete ns velero --timeout=30s --wait=false", ignore_error=True, quiet=True)
-    time.sleep(10)
+    time.sleep(10) # Wait for termination
 
 def install_velero(context):
     if CONFIG['cleanup']: cleanup_velero(context)
@@ -293,15 +291,19 @@ def install_velero(context):
 
 # --- MAIN ---
 def main():
+    # --- CORREÇÃO DE PERMISSÃO ---
+    # Define onde o kubectl vai salvar o arquivo de configuração.
+    # O diretório atual (.) é garantido que o Jenkins tem permissão.
+    os.environ["KUBECONFIG"] = os.path.join(os.getcwd(), "kube_config")
+    # -----------------------------
+
     load_config()
     
     # 1. Validação de Infra
     validate_bucket(CONFIG['bucket_name'])
     CONFIG['role_name'] = extract_and_validate_role(CONFIG['role_arn'])
     
-    # Garante permissão na role
     ensure_role_permissions(CONFIG['role_name'])
-    
     generate_velero_values(CONFIG['bucket_name'], CONFIG['role_arn'], CONFIG['region'])
 
     # 2. Contextos
