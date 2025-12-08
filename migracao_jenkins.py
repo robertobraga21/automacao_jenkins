@@ -64,16 +64,14 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V48 (Split Workflow & Strict OIDC) ---")
+    print("\n🚀 --- Migração EKS V49 (Final Fix) ---")
     
     CONFIG['region'] = get_required_env("AWS_REGION")
-    CONFIG['mode'] = get_required_env("OPERATION_MODE") # FULL, BACKUP_ONLY, RESTORE_ONLY
+    CONFIG['mode'] = get_required_env("OPERATION_MODE") # FULL_MIGRATION, BACKUP_ONLY, RESTORE_ONLY
     
-    # Bucket e Role sempre obrigatórios
     CONFIG['bucket_name'] = get_required_env("VELERO_BUCKET_NAME")
     CONFIG['role_arn'] = get_required_env("VELERO_ROLE_ARN")
     
-    # Clusters dependem do modo
     CONFIG['cluster_src'] = None
     CONFIG['cluster_dst'] = None
     
@@ -83,16 +81,15 @@ def load_config():
     if CONFIG['mode'] in ['FULL_MIGRATION', 'RESTORE_ONLY']:
         CONFIG['cluster_dst'] = get_required_env("CLUSTER_DEST_NAME")
 
-    # Nome do Backup para Restore Only
     CONFIG['restore_backup_name'] = get_env_opt("BACKUP_NAME_TO_RESTORE")
     if CONFIG['mode'] == 'RESTORE_ONLY' and not CONFIG['restore_backup_name']:
-        print("⛔ ERRO: Para RESTORE_ONLY, você deve fornecer o 'BACKUP_NAME_TO_RESTORE'.")
+        print("⛔ ERRO: Para RESTORE_ONLY, forneça 'BACKUP_NAME_TO_RESTORE'.")
         sys.exit(1)
 
     CONFIG['istio_sync_mode'] = get_env_opt("ISTIO_SYNC_MODE", "all").lower()
     CONFIG['cleanup'] = get_env_opt("CLEANUP_ENABLED", "false").lower() == 'true'
 
-    print(f"   ℹ️  Modo de Operação: {CONFIG['mode']}")
+    print(f"   ℹ️  Modo: {CONFIG['mode']}")
     print(f"   ℹ️  Região: {CONFIG['region']}")
     if CONFIG['cluster_src']: print(f"   ℹ️  Origem: {CONFIG['cluster_src']}")
     if CONFIG['cluster_dst']: print(f"   ℹ️  Destino: {CONFIG['cluster_dst']}")
@@ -176,18 +173,12 @@ def ensure_role_permissions(role_name):
         get_aws_session().client('iam').put_role_policy(RoleName=role_name, PolicyName="VeleroPerms", PolicyDocument=json.dumps(VELERO_IAM_POLICY))
     except Exception as e: print(f"      ⚠️  Falha permissoes: {e}")
 
-# --- NOVIDADE: STRICT OIDC POLICY ---
+# --- STRICT OIDC POLICY ---
 def enforce_strict_oidc_policy(role_name, allowed_oidcs):
-    """
-    Reescreve a Trust Policy mantendo apenas root e os OIDCs informados.
-    Remove qualquer outro cluster que estava lá antes.
-    """
-    print(f"   🔒 [STRICT OIDC] Limpando e aplicando Trust Policy em '{role_name}'...")
+    print(f"   🔒 [STRICT OIDC] Atualizando Trust Policy em '{role_name}'...")
     iam = get_aws_session().client('iam')
-    sts = get_aws_session().client('sts')
-    acc = sts.get_caller_identity()["Account"]
+    acc = get_aws_session().client('sts').get_caller_identity()["Account"]
     
-    # 1. Base Policy (Sempre confia na conta root)
     new_statements = [
         {
             "Effect": "Allow",
@@ -196,10 +187,8 @@ def enforce_strict_oidc_policy(role_name, allowed_oidcs):
         }
     ]
 
-    # 2. Adiciona APENAS os OIDCs permitidos (Origem e/ou Destino atuais)
     for oidc in allowed_oidcs:
         oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
-        print(f"      ➕ Permitindo OIDC: {oidc}")
         new_statements.append({
             "Effect": "Allow",
             "Principal": {"Federated": oidc_arn},
@@ -211,22 +200,17 @@ def enforce_strict_oidc_policy(role_name, allowed_oidcs):
             }
         })
 
-    # 3. Aplica a nova política (sobrescrevendo a antiga)
     policy_doc = {"Version": "2012-10-17", "Statement": new_statements}
     try:
         iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(policy_doc))
-        print("      ✅ Policy atualizada com sucesso (Clusters antigos removidos).")
-        time.sleep(5) # Propagação
+        print("      ✅ Policy atualizada (Clusters antigos removidos).")
+        time.sleep(5)
     except Exception as e:
-        print(f"      ⛔ Erro ao atualizar Trust Policy: {e}")
-        sys.exit(1)
+        print(f"      ⛔ Erro ao atualizar Trust Policy: {e}"); sys.exit(1)
 
 def update_app_irsa_trust(role_name, oidc, ns, sa):
-    # Função auxiliar para adicionar trust em roles de APLICAÇÃO (não a do Velero)
-    # Aqui usamos append porque não queremos quebrar outras coisas que a role de app use
     iam = get_aws_session().client('iam')
-    sts = get_aws_session().client('sts')
-    acc = sts.get_caller_identity()["Account"]
+    acc = get_aws_session().client('sts').get_caller_identity()["Account"]
     oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
     try:
         role_data = iam.get_role(RoleName=role_name)
@@ -237,7 +221,6 @@ def update_app_irsa_trust(role_name, oidc, ns, sa):
                 for k,v in cond.items():
                     if f"{oidc}:sub" in k and v == f"system:serviceaccount:{ns}:{sa}": return False
         
-        # print(f"   ➕ IRSA App: Trust {oidc} -> {role_name}")
         pol['Statement'].append({
             "Effect": "Allow", "Principal": {"Federated": oidc_arn}, "Action": "sts:AssumeRoleWithWebIdentity",
             "Condition": {"StringEquals": {f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"}}
@@ -323,7 +306,7 @@ def sync_istio_resources(src_ctx, dst_ctx):
 # --- 6. VELERO CONTROL ---
 def wait_for_backup_sync(bk):
     print(f"⏳ Aguardando sync do backup '{bk}' no destino...")
-    for i in range(30): # 2.5 min
+    for i in range(30):
         res = subprocess.run(f"velero backup describe {bk}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode == 0: print(f"   ✅ Backup disponível!"); return True
         time.sleep(5)
@@ -334,13 +317,9 @@ def cleanup_velero(context):
     run_shell(f"kubectl config use-context {context}", quiet=True)
     run_shell("helm uninstall velero -n velero", ignore_error=True, quiet=True)
     run_shell("kubectl delete ns velero --timeout=5s --wait=false", ignore_error=True, quiet=True)
-    
-    # Loop de espera (Zombie Killer)
     for i in range(20):
-        if subprocess.run("kubectl get ns velero", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
-            return
-        if i == 6: # Se demorar > 12s
-             run_shell(f"kubectl get namespace velero -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/velero/finalize -f -", ignore_error=True, quiet=True)
+        if subprocess.run("kubectl get ns velero", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0: return
+        if i == 6: run_shell(f"kubectl get namespace velero -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/velero/finalize -f -", ignore_error=True, quiet=True)
         time.sleep(2)
 
 def install_velero(context):
@@ -352,45 +331,33 @@ def install_velero(context):
     run_shell("helm repo update", quiet=True)
     cmd = f"helm upgrade --install velero vmware-tanzu/velero --namespace velero -f values.yaml --reset-values --wait"
     if not run_shell(cmd, quiet=True, ignore_error=True):
-        cleanup_velero(context) # Retry logic
-        run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True)
-        run_shell(cmd, quiet=True)
+        cleanup_velero(context); run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True); run_shell(cmd, quiet=True)
     run_shell("kubectl rollout restart deployment velero -n velero", quiet=True)
 
 # --- MAIN FLOWS ---
-
 def execute_backup_flow(ctx_src, allowed_oidcs):
     bk = f"migracao-{int(time.time())}"
-    
-    # Atualiza Role (Só com os OIDCs necessários)
     enforce_strict_oidc_policy(CONFIG['role_name'], allowed_oidcs)
-    
     print(f"\n--- 🚀 FASE ORIGEM (Backup) ---")
     install_velero(ctx_src)
     print(f"💾 Criando Backup: {bk}")
-    
     try:
         run_shell(f"velero backup create {bk} --exclude-namespaces {','.join(SYSTEM_NAMESPACES)} --exclude-resources {EXCLUDE_RESOURCES} --wait")
-        print("⏳ Aguardando 60s para consolidação do Snapshot...")
+        print("⏳ Aguardando 60s para consolidação...")
         time.sleep(60)
-        print(f"✅ Backup '{bk}' concluído com sucesso.")
+        print(f"✅ Backup '{bk}' concluído.")
         return bk
-    except SystemExit:
-        print("❌ Backup falhou."); sys.exit(1)
+    except SystemExit: print("❌ Backup falhou."); sys.exit(1)
 
 def execute_restore_flow(ctx_dst, bk_name, allowed_oidcs):
-    # Atualiza Role (Só com os OIDCs necessários)
     enforce_strict_oidc_policy(CONFIG['role_name'], allowed_oidcs)
-    
     print(f"\n--- 🛬 FASE DESTINO (Restore) ---")
     install_velero(ctx_dst)
-    
     if wait_for_backup_sync(bk_name):
         print(f"♻️  Restaurando '{bk_name}'...")
         run_shell(f"velero restore create --from-backup {bk_name} --existing-resource-policy update --exclude-resources {EXCLUDE_RESOURCES} --wait")
         print("\n🎉 Restore finalizado com sucesso!")
-    else:
-        print("\n⛔ Restore abortado (Backup não encontrado)."); sys.exit(1)
+    else: print("\n⛔ Restore abortado."); sys.exit(1)
 
 # --- MAIN ---
 def main():
@@ -400,13 +367,11 @@ def main():
     
     load_config()
     
-    # 1. Validações Base
     validate_bucket(CONFIG['bucket_name'])
     CONFIG['role_name'] = extract_and_validate_role(CONFIG['role_arn'])
     ensure_role_permissions(CONFIG['role_name'])
     generate_velero_values(CONFIG['bucket_name'], CONFIG['role_arn'], CONFIG['region'])
 
-    # 2. Resolução de Contextos e OIDCs
     ctx_src, ctx_dst = None, None
     oidc_src, oidc_dst = None, None
     allowed_oidcs = []
@@ -421,7 +386,6 @@ def main():
         oidc_dst = get_cluster_oidc(CONFIG['cluster_dst'])
         allowed_oidcs.append(oidc_dst)
 
-    # 3. Execução baseada no MODO
     mode = CONFIG['mode']
     
     if mode == 'BACKUP_ONLY':
@@ -431,8 +395,8 @@ def main():
         execute_restore_flow(ctx_dst, CONFIG['restore_backup_name'], allowed_oidcs)
         
     elif mode == 'FULL_MIGRATION':
-        # IRSA e Istio só fazem sentido se tivermos Origem E Destino
-        update_trust_policy(CONFIG['role_name'], oidc_src, "velero", "velero-server") # Trust temporário para ler origem
+        # Trust temporário para ler apps da origem
+        update_trust_policy(CONFIG['role_name'], oidc_src, "velero", "velero-server") 
         run_pre_flight_irsa(ctx_src, oidc_dst)
         sync_istio_resources(ctx_src, ctx_dst)
         
