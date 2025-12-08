@@ -18,6 +18,28 @@ SYSTEM_NAMESPACES = [
 
 EXCLUDE_RESOURCES = "pods,replicasets,endpoints,endpointslices"
 
+VELERO_IAM_POLICY = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:DescribeVolumes", "ec2:DescribeSnapshots", "ec2:CreateTags",
+                "ec2:CreateVolume", "ec2:CreateSnapshot", "ec2:DeleteSnapshot"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject", "s3:DeleteObject", "s3:PutObject",
+                "s3:AbortMultipartUpload", "s3:ListBucket"
+            ],
+            "Resource": "*" 
+        }
+    ]
+}
+
 # --- 0. HELPERS ---
 def get_env_opt(var_name, default=None):
     return os.getenv(var_name, default)
@@ -42,10 +64,10 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V52 (Least Privilege S3) ---")
+    print("\n🚀 --- Migração EKS V53 (Consolidated Logic) ---")
     
     CONFIG['region'] = get_required_env("AWS_REGION")
-    CONFIG['mode'] = get_required_env("OPERATION_MODE")
+    CONFIG['mode'] = get_required_env("OPERATION_MODE") 
     
     CONFIG['bucket_name'] = get_required_env("VELERO_BUCKET_NAME")
     CONFIG['role_arn'] = get_required_env("VELERO_ROLE_ARN")
@@ -65,7 +87,6 @@ def load_config():
         sys.exit(1)
 
     CONFIG['istio_sync_mode'] = get_env_opt("ISTIO_SYNC_MODE", "all").lower()
-    CONFIG['cleanup'] = get_env_opt("CLEANUP_ENABLED", "false").lower() == 'true'
 
     print(f"   ℹ️  Modo: {CONFIG['mode']}")
     print(f"   ℹ️  Região: {CONFIG['region']}")
@@ -145,11 +166,9 @@ cleanUpCRDs: false
 def get_cluster_oidc(name):
     return get_aws_session().client('eks').describe_cluster(name=name)['cluster']['identity']['oidc']['issuer'].replace("https://", "")
 
-# --- GERAÇÃO DINÂMICA DE POLICY SEGURA ---
 def ensure_role_permissions(role_name, bucket_name):
     print(f"   🛡️  Blindando permissões na role '{role_name}'...")
-    
-    # Policy fechada no bucket específico
+    # Política restrita ao bucket escolhido
     policy_doc = {
         "Version": "2012-10-17",
         "Statement": [
@@ -174,55 +193,26 @@ def ensure_role_permissions(role_name, bucket_name):
             }
         ]
     }
-    
     try:
-        get_aws_session().client('iam').put_role_policy(
-            RoleName=role_name, 
-            PolicyName="VeleroPerms", 
-            PolicyDocument=json.dumps(policy_doc)
-        )
+        get_aws_session().client('iam').put_role_policy(RoleName=role_name, PolicyName="VeleroPerms", PolicyDocument=json.dumps(policy_doc))
         print(f"      ✅ Policy aplicada (Restrita ao bucket '{bucket_name}').")
-    except Exception as e: 
-        print(f"      ⚠️  Falha permissoes: {e}")
+    except Exception as e: print(f"      ⚠️  Falha permissoes: {e}")
 
-# --- 5. LÓGICA CORE ---
-def update_trust_policy(role_name, oidc, ns, sa):
-    iam = get_aws_session().client('iam'); sts = get_aws_session().client('sts')
-    acc = sts.get_caller_identity()["Account"]
-    oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
-    try:
-        role_data = iam.get_role(RoleName=role_name)
-        pol = role_data['Role']['AssumeRolePolicyDocument']
-        for s in pol['Statement']:
-            if s.get('Principal', {}).get('Federated') == oidc_arn:
-                cond = s.get('Condition', {}).get('StringEquals', {})
-                for k,v in cond.items():
-                    if f"{oidc}:sub" in k and v == f"system:serviceaccount:{ns}:{sa}": return False
-        
-        pol['Statement'].append({
-            "Effect": "Allow", "Principal": {"Federated": oidc_arn}, "Action": "sts:AssumeRoleWithWebIdentity",
-            "Condition": {"StringEquals": {f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"}}
-        })
-        iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(pol))
-        return True
-    except Exception as e: 
-        print(f"   ⚠️  Aviso: Falha ao atualizar Trust Policy: {e}")
-        return False
+# --- 5. LÓGICA CORE (TRUST / IRSA) ---
 
-def enforce_strict_oidc_policy(role_name, allowed_oidcs):
-    print(f"   🔒 [STRICT OIDC] Limpando e aplicando Trust Policy em '{role_name}'...")
+def configure_irsa_trust(role_name, oidcs_list, ns, sa):
+    """
+    Limpa a policy e adiciona confiança para os OIDCs da lista (Consolidação).
+    """
     iam = get_aws_session().client('iam')
-    acc = get_aws_session().client('sts').get_caller_identity()["Account"]
+    sts = get_aws_session().client('sts')
+    acc = sts.get_caller_identity()["Account"]
     
     new_statements = [
-        {
-            "Effect": "Allow",
-            "Principal": {"AWS": f"arn:aws:iam::{acc}:root"},
-            "Action": "sts:AssumeRole"
-        }
+        {"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{acc}:root"}, "Action": "sts:AssumeRole"}
     ]
 
-    for oidc in allowed_oidcs:
+    for oidc in oidcs_list:
         oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
         new_statements.append({
             "Effect": "Allow",
@@ -230,21 +220,33 @@ def enforce_strict_oidc_policy(role_name, allowed_oidcs):
             "Action": "sts:AssumeRoleWithWebIdentity",
             "Condition": {
                 "StringEquals": {
-                    f"{oidc}:sub": ["system:serviceaccount:velero:velero-server", "system:serviceaccount:velero:velero"]
+                    f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"
                 }
             }
         })
+    # Caso especial para o velero-server que as vezes pode ser chamado de velero em versões antigas
+    if sa == "velero-server":
+         # Adiciona compatibilidade para SA 'velero' também, por segurança
+         for oidc in oidcs_list:
+            oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
+            new_statements.append({
+                "Effect": "Allow",
+                "Principal": {"Federated": oidc_arn},
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {"StringEquals": {f"{oidc}:sub": "system:serviceaccount:velero:velero"}}
+            })
 
     policy_doc = {"Version": "2012-10-17", "Statement": new_statements}
+    
     try:
         iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(policy_doc))
-        print("      ✅ Policy atualizada (Clean).")
-        time.sleep(5)
+        return True
     except Exception as e:
-        print(f"      ⛔ Erro Strict Policy: {e}"); sys.exit(1)
+        print(f"      ⛔ Erro ao consolidar Trust Policy para {role_name}: {e}")
+        return False
 
-def run_pre_flight_irsa(ctx, dest_oidc):
-    print(f"\n🕵️  [IRSA] Scan de Aplicações em {ctx}...")
+def run_pre_flight_irsa(ctx, oidcs_list):
+    print(f"\n🕵️  [IRSA] Scan e Consolidação de Aplicações em {ctx}...")
     try:
         k8s_config.load_kube_config(config_file=os.environ["KUBECONFIG"], context=ctx)
         v1 = client.CoreV1Api()
@@ -259,11 +261,13 @@ def run_pre_flight_irsa(ctx, dest_oidc):
         if arn:
             r_name = arn.split("/")[-1]
             if r_name == CONFIG['role_name'] or "aws-service-role" in r_name: continue
-            if update_trust_policy(r_name, dest_oidc, ns, sa.metadata.name): 
+            
+            # Aqui está a mágica: Passamos a lista de TODOS os OIDCs (src + dst)
+            if configure_irsa_trust(r_name, oidcs_list, ns, sa.metadata.name): 
                 cnt += 1; time.sleep(0.2)
-    print(f"✅ {cnt} apps atualizadas.")
+    print(f"✅ {cnt} apps consolidadas (Permitindo Origem + Destino).")
 
-# --- 5. ISTIO SYNC ---
+# --- 6. ISTIO SYNC ---
 def sanitize_k8s_object(obj):
     if 'metadata' in obj:
         for field in ['resourceVersion', 'uid', 'creationTimestamp', 'generation', 'ownerReferences', 'managedFields']:
@@ -317,7 +321,7 @@ def sync_istio_resources(src_ctx, dst_ctx):
                 except: print(f"    ❌ Falha update: {name}")
             else: print(f"    ❌ Falha create: {name}")
 
-# --- 6. VELERO CONTROL ---
+# --- 7. VELERO CONTROL ---
 def wait_for_backup_sync(bk):
     print(f"⏳ Aguardando sync do backup '{bk}' no destino...")
     for i in range(30):
@@ -326,32 +330,50 @@ def wait_for_backup_sync(bk):
         time.sleep(5)
     print("\n❌ Timeout sync."); return False
 
+def force_delete_namespace(ns):
+    print(f"   ⚠️  Forçando remoção de '{ns}' (Zombie Killer)...")
+    cmd = (f"kubectl get namespace {ns} -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/{ns}/finalize -f -")
+    run_shell(cmd, ignore_error=True, quiet=True)
+
 def cleanup_velero(context):
-    print(f"🧹 [CLEANUP] Limpando {context}...")
+    print(f"🧹 [CLEANUP] Limpando {context} (Mandatório)...")
     run_shell(f"kubectl config use-context {context}", quiet=True)
     run_shell("helm uninstall velero -n velero", ignore_error=True, quiet=True)
     run_shell("kubectl delete ns velero --timeout=5s --wait=false", ignore_error=True, quiet=True)
+    
+    # Loop de espera (Zombie Killer)
     for i in range(20):
-        if subprocess.run("kubectl get ns velero", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0: return
-        if i == 6: run_shell(f"kubectl get namespace velero -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/velero/finalize -f -", ignore_error=True, quiet=True)
+        if subprocess.run("kubectl get ns velero", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            print("      ✅ Limpeza concluída.")
+            return
+        if i == 6: 
+             force_delete_namespace("velero")
         time.sleep(2)
+    print("      ⚠️  Aviso: Namespace ainda consta como Terminating. Tentando prosseguir.")
 
 def install_velero(context):
-    if CONFIG['cleanup']: cleanup_velero(context)
+    # CLEANUP MANDATÓRIO AGORA
+    cleanup_velero(context)
+    
     print(f"⚓ [{context}] Instalando Velero...")
     run_shell(f"kubectl config use-context {context}", quiet=True)
     run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True)
+    
     run_shell("helm repo add vmware-tanzu https://vmware-tanzu.github.io/helm-charts", quiet=True)
     run_shell("helm repo update", quiet=True)
+    
     cmd = f"helm upgrade --install velero vmware-tanzu/velero --namespace velero -f values.yaml --reset-values --wait"
     if not run_shell(cmd, quiet=True, ignore_error=True):
-        cleanup_velero(context); run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True); run_shell(cmd, quiet=True)
+        print("   ❌ Erro Helm. Retry com força bruta...")
+        cleanup_velero(context)
+        run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True)
+        run_shell(cmd, quiet=True)
+
     run_shell("kubectl rollout restart deployment velero -n velero", quiet=True)
 
 # --- MAIN FLOWS ---
-def execute_backup_flow(ctx_src, allowed_oidcs):
+def execute_backup_flow(ctx_src):
     bk = f"migracao-{int(time.time())}"
-    enforce_strict_oidc_policy(CONFIG['role_name'], allowed_oidcs)
     print(f"\n--- 🚀 FASE ORIGEM (Backup) ---")
     install_velero(ctx_src)
     print(f"💾 Criando Backup: {bk}")
@@ -363,8 +385,7 @@ def execute_backup_flow(ctx_src, allowed_oidcs):
         return bk
     except SystemExit: print("❌ Backup falhou."); sys.exit(1)
 
-def execute_restore_flow(ctx_dst, bk_name, allowed_oidcs):
-    enforce_strict_oidc_policy(CONFIG['role_name'], allowed_oidcs)
+def execute_restore_flow(ctx_dst, bk_name):
     print(f"\n--- 🛬 FASE DESTINO (Restore) ---")
     install_velero(ctx_dst)
     if wait_for_backup_sync(bk_name):
@@ -384,40 +405,48 @@ def main():
     validate_bucket(CONFIG['bucket_name'])
     CONFIG['role_name'] = extract_and_validate_role(CONFIG['role_arn'])
     
-    # Chamada corrigida passando o bucket_name
+    # Permission Enforcer com escopo de Bucket
     ensure_role_permissions(CONFIG['role_name'], CONFIG['bucket_name'])
     
     generate_velero_values(CONFIG['bucket_name'], CONFIG['role_arn'], CONFIG['region'])
 
     ctx_src, ctx_dst = None, None
     oidc_src, oidc_dst = None, None
-    allowed_oidcs = []
+    valid_oidcs = []
 
     if CONFIG['cluster_src']:
         ctx_src = setup_kube_context(CONFIG['cluster_src'])
         oidc_src = get_cluster_oidc(CONFIG['cluster_src'])
-        allowed_oidcs.append(oidc_src)
+        valid_oidcs.append(oidc_src)
 
     if CONFIG['cluster_dst']:
         ctx_dst = setup_kube_context(CONFIG['cluster_dst'])
         oidc_dst = get_cluster_oidc(CONFIG['cluster_dst'])
-        allowed_oidcs.append(oidc_dst)
+        valid_oidcs.append(oidc_dst)
 
+    # 1. CONSOLIDAR TRUST POLICIES (LIMPEZA INICIAL - UMA VEZ SÓ)
+    print("\n🔒 [TRUST CLEANUP] Consolidando permissões IAM...")
+    
+    # Velero Role: Limpa e adiciona apenas os clusters envolvidos (Origem e Destino)
+    configure_irsa_trust(CONFIG['role_name'], valid_oidcs, "velero", "velero-server")
+    
+    # App Roles: Se tiver origem, limpa e prepara para ambos
+    if ctx_src:
+        run_pre_flight_irsa(ctx_src, valid_oidcs)
+
+    # 2. EXECUÇÃO
     mode = CONFIG['mode']
     
     if mode == 'BACKUP_ONLY':
-        execute_backup_flow(ctx_src, allowed_oidcs)
+        execute_backup_flow(ctx_src)
         
     elif mode == 'RESTORE_ONLY':
-        execute_restore_flow(ctx_dst, CONFIG['restore_backup_name'], allowed_oidcs)
+        execute_restore_flow(ctx_dst, CONFIG['restore_backup_name'])
         
     elif mode == 'FULL_MIGRATION':
-        update_trust_policy(CONFIG['role_name'], oidc_src, "velero", "velero-server") 
-        run_pre_flight_irsa(ctx_src, oidc_dst)
         sync_istio_resources(ctx_src, ctx_dst)
-        
-        backup_name = execute_backup_flow(ctx_src, allowed_oidcs)
-        execute_restore_flow(ctx_dst, backup_name, allowed_oidcs)
+        backup_name = execute_backup_flow(ctx_src)
+        execute_restore_flow(ctx_dst, backup_name)
 
     print("\n✅ Processo finalizado.")
 
