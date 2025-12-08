@@ -61,7 +61,7 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V46 (Helm Repo Fix) ---")
+    print("\n🚀 --- Migração EKS V47 (Zombie Killer Fix) ---")
     
     CONFIG['env'] = get_required_env("ENV_TYPE").upper()
     CONFIG['region'] = get_required_env("AWS_REGION")
@@ -214,7 +214,7 @@ def run_pre_flight_irsa(ctx, dest_oidc):
                 cnt += 1; time.sleep(0.2)
     print(f"✅ {cnt} apps atualizadas.")
 
-# --- 5. ISTIO SYNC (HEADLESS) ---
+# --- 5. ISTIO SYNC ---
 def sanitize_k8s_object(obj):
     if 'metadata' in obj:
         for field in ['resourceVersion', 'uid', 'creationTimestamp', 'generation', 'ownerReferences', 'managedFields']:
@@ -271,7 +271,7 @@ def sync_istio_resources(src_ctx, dst_ctx):
                 except: print(f"    ❌ Falha update: {name}")
             else: print(f"    ❌ Falha create: {name}")
 
-# --- 6. VELERO CONTROL ---
+# --- 6. VELERO CONTROL (NOVA LÓGICA DE LIMPEZA) ---
 def wait_for_backup_sync(bk):
     print(f"⏳ Aguardando sync do backup '{bk}' no destino...")
     for i in range(24):
@@ -280,33 +280,64 @@ def wait_for_backup_sync(bk):
         time.sleep(5)
     print("\n❌ Timeout sync."); return False
 
+def force_delete_namespace(ns):
+    print(f"   ⚠️  Forçando remoção de '{ns}' (Finalizers)...")
+    cmd = (f"kubectl get namespace {ns} -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/{ns}/finalize -f -")
+    run_shell(cmd, ignore_error=True, quiet=True)
+
 def cleanup_velero(context):
-    print(f"🧹 [CLEANUP] Limpando {context}...")
+    print(f"🧹 [CLEANUP] Limpando {context} (Modo Seguro)...")
     run_shell(f"kubectl config use-context {context}", quiet=True)
+    
+    # 1. Tenta desinstalar com Helm (educadamente)
     run_shell("helm uninstall velero -n velero", ignore_error=True, quiet=True)
-    run_shell("kubectl delete ns velero --timeout=30s --wait=false", ignore_error=True, quiet=True)
-    time.sleep(10)
+    
+    # 2. Manda deletar o namespace
+    run_shell("kubectl delete ns velero --timeout=5s --wait=false", ignore_error=True, quiet=True)
+    
+    # 3. LOOP DE ESPERA (POLLING) - Aqui está o segredo
+    print("   ⏳ Aguardando namespace morrer...")
+    for i in range(30): # Tenta por 60 segundos (30x2s)
+        # Verifica se o namespace ainda existe
+        check = subprocess.run("kubectl get ns velero", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        if check.returncode != 0: 
+            print("   ✅ Namespace removido com sucesso.")
+            return # Sucesso! Sai da função
+        
+        # Se passou de 15 segundos (i > 7) e ainda existe, força a barra
+        if i == 8:
+            force_delete_namespace("velero")
+            
+        time.sleep(2)
+        
+    print("   ⚠️  Aviso: Namespace ainda consta como Terminating, mas vamos tentar prosseguir.")
 
 def install_velero(context):
     if CONFIG['cleanup']: cleanup_velero(context)
+    
     print(f"⚓ [{context}] Instalando Velero...")
     run_shell(f"kubectl config use-context {context}", quiet=True)
     run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True)
     
-    # --- CORREÇÃO: ADICIONA REPO ANTES DE INSTALAR ---
+    # Adiciona repo para garantir (fix da V46)
     run_shell("helm repo add vmware-tanzu https://vmware-tanzu.github.io/helm-charts", quiet=True)
     run_shell("helm repo update", quiet=True)
-    # ------------------------------------------------
     
     cmd = f"helm upgrade --install velero vmware-tanzu/velero --namespace velero -f values.yaml --reset-values --wait"
-    run_shell(cmd, quiet=True)
+    if not run_shell(cmd, quiet=True, ignore_error=True):
+        print("   ❌ Erro no Helm. Tentando forçar cleanup e reinstalar...")
+        cleanup_velero(context)
+        run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True)
+        run_shell(cmd, quiet=True)
+
     run_shell("kubectl rollout restart deployment velero -n velero", quiet=True)
 
 # --- MAIN ---
 def main():
-    # Fix para permissões no Jenkins
-    os.environ["HOME"] = os.getcwd()
-    os.environ["KUBECONFIG"] = os.path.join(os.getcwd(), "kube_config")
+    cwd = os.getcwd()
+    os.environ["HOME"] = cwd
+    os.environ["KUBECONFIG"] = os.path.join(cwd, "kube_config")
     
     load_config()
     
