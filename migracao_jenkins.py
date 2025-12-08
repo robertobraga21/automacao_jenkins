@@ -65,7 +65,7 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V54 (Logic Fixed) ---")
+    print("\n🚀 --- Migração EKS V55 (Safe Trust Management) ---")
     
     CONFIG['region'] = get_required_env("AWS_REGION")
     CONFIG['mode'] = get_required_env("OPERATION_MODE") 
@@ -198,51 +198,79 @@ def ensure_role_permissions(role_name, bucket_name):
         print(f"      ✅ Policy aplicada (Restrita ao bucket '{bucket_name}').")
     except Exception as e: print(f"      ⚠️  Falha permissoes: {e}")
 
-# --- 5. LÓGICA CORE (TRUST / IRSA) ---
+# --- 5. LÓGICA CORE (SAFE TRUST MANAGEMENT) ---
 
-def configure_irsa_trust(role_name, oidcs_list, ns, sa):
+def manage_irsa_trust(role_name, oidcs_to_add, ns, sa, mode='append'):
     """
-    Limpa a policy e adiciona confiança APENAS para os OIDCs da lista.
-    Garante que não haja duplicatas.
+    mode='replace': Limpa tudo e deixa SÓ os oidcs passados (Para Full Migration).
+    mode='append': Mantém o que tem e adiciona os novos se faltar (Para Backup/Restore isolados).
     """
     iam = get_aws_session().client('iam')
     sts = get_aws_session().client('sts')
     acc = sts.get_caller_identity()["Account"]
     
-    # 1. Base Policy
-    new_statements = [
-        {"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{acc}:root"}, "Action": "sts:AssumeRole"}
-    ]
-
-    # 2. Remove duplicatas da lista de OIDCs (set)
-    unique_oidcs = list(set(oidcs_list))
-
-    # 3. Adiciona permissões estritamente necessárias
-    for oidc in unique_oidcs:
-        oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
-        new_statements.append({
-            "Effect": "Allow",
-            "Principal": {"Federated": oidc_arn},
-            "Action": "sts:AssumeRoleWithWebIdentity",
-            "Condition": {
-                "StringEquals": {
-                    f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"
-                }
-            }
-        })
-
-    # 4. Reescreve a Policy
-    policy_doc = {"Version": "2012-10-17", "Statement": new_statements}
-    
     try:
-        iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(policy_doc))
-        return True
+        # Pega policy atual
+        current_policy = iam.get_role(RoleName=role_name)['Role']['AssumeRolePolicyDocument']
+        
+        # Se for REPLACE, começamos do zero apenas com Root
+        if mode == 'replace':
+            new_statements = [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{acc}:root"}, "Action": "sts:AssumeRole"}]
+        else:
+            # Se for APPEND, usamos o que já tem
+            new_statements = current_policy.get('Statement', [])
+
+        # Lista de OIDCs a garantir
+        unique_oidcs = list(set(oidcs_to_add))
+        
+        updated = False
+
+        for oidc in unique_oidcs:
+            oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
+            
+            # Verifica se já existe para não duplicar
+            exists = False
+            for s in new_statements:
+                if s.get('Principal', {}).get('Federated') == oidc_arn:
+                    # Verifica a condition
+                    cond = s.get('Condition', {}).get('StringEquals', {})
+                    for k, v in cond.items():
+                        if f"{oidc}:sub" in k and v == f"system:serviceaccount:{ns}:{sa}":
+                            exists = True
+                            break
+            
+            if not exists:
+                new_statements.append({
+                    "Effect": "Allow",
+                    "Principal": {"Federated": oidc_arn},
+                    "Action": "sts:AssumeRoleWithWebIdentity",
+                    "Condition": {
+                        "StringEquals": {
+                            f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"
+                        }
+                    }
+                })
+                updated = True
+        
+        if updated or mode == 'replace':
+            policy_doc = {"Version": "2012-10-17", "Statement": new_statements}
+            iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(policy_doc))
+            
+            if mode == 'replace':
+                print(f"      🔒 Policy REESCRITA (Limpeza feita).")
+            else:
+                print(f"      ➕ Policy ATUALIZADA (Append safe).")
+                
+            return True
+        
+        return False # Nada mudou
+        
     except Exception as e:
-        print(f"      ⛔ Erro ao consolidar Trust Policy para {role_name}: {e}")
+        print(f"      ⛔ Erro ao gerenciar Trust Policy ({mode}) para {role_name}: {e}")
         return False
 
-def run_pre_flight_irsa(ctx, oidcs_list):
-    print(f"\n🕵️  [IRSA] Scan e Consolidação de Aplicações em {ctx}...")
+def run_pre_flight_irsa(ctx, oidcs_list, mode):
+    print(f"\n🕵️  [IRSA] Scan de Aplicações em {ctx} (Mode: {mode})...")
     try:
         k8s_config.load_kube_config(config_file=os.environ["KUBECONFIG"], context=ctx)
         v1 = client.CoreV1Api()
@@ -258,10 +286,10 @@ def run_pre_flight_irsa(ctx, oidcs_list):
             r_name = arn.split("/")[-1]
             if r_name == CONFIG['role_name'] or "aws-service-role" in r_name: continue
             
-            # Limpa e atualiza (sem criar duplicatas de legacy)
-            if configure_irsa_trust(r_name, oidcs_list, ns, sa.metadata.name): 
+            # Aqui chamamos o gerenciador com o modo correto (replace ou append)
+            if manage_irsa_trust(r_name, oidcs_list, ns, sa.metadata.name, mode=mode): 
                 cnt += 1; time.sleep(0.2)
-    print(f"✅ {cnt} apps consolidadas.")
+    print(f"✅ {cnt} apps processadas.")
 
 # --- 6. ISTIO SYNC ---
 def sanitize_k8s_object(obj):
@@ -326,13 +354,8 @@ def wait_for_backup_sync(bk):
         time.sleep(5)
     print("\n❌ Timeout sync."); return False
 
-def force_delete_namespace(ns):
-    print(f"   ⚠️  Forçando remoção de '{ns}' (Zombie Killer)...")
-    cmd = (f"kubectl get namespace {ns} -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/{ns}/finalize -f -")
-    run_shell(cmd, ignore_error=True, quiet=True)
-
 def cleanup_velero(context):
-    print(f"🧹 [CLEANUP] Limpando {context} (Mandatório)...")
+    print(f"🧹 [CLEANUP] Limpando {context}...")
     run_shell(f"kubectl config use-context {context}", quiet=True)
     run_shell("helm uninstall velero -n velero", ignore_error=True, quiet=True)
     run_shell("kubectl delete ns velero --timeout=5s --wait=false", ignore_error=True, quiet=True)
@@ -342,7 +365,7 @@ def cleanup_velero(context):
             print("      ✅ Limpeza concluída.")
             return
         if i == 6: 
-             force_delete_namespace("velero")
+             run_shell(f"kubectl get namespace velero -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/velero/finalize -f -", ignore_error=True, quiet=True)
         time.sleep(2)
     print("      ⚠️  Aviso: Namespace ainda consta como Terminating. Tentando prosseguir.")
 
@@ -358,7 +381,7 @@ def install_velero(context):
     
     cmd = f"helm upgrade --install velero vmware-tanzu/velero --namespace velero -f values.yaml --reset-values --wait"
     if not run_shell(cmd, quiet=True, ignore_error=True):
-        print("   ❌ Erro Helm. Tentando forçar reinstalação...")
+        print("   ❌ Erro Helm. Retry com força bruta...")
         cleanup_velero(context)
         run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True)
         run_shell(cmd, quiet=True)
@@ -366,7 +389,7 @@ def install_velero(context):
     run_shell("kubectl rollout restart deployment velero -n velero", quiet=True)
 
 # --- MAIN FLOWS ---
-def execute_backup_flow(ctx_src):
+def execute_backup_flow(ctx_src, trust_mode):
     bk = f"migracao-{int(time.time())}"
     print(f"\n--- 🚀 FASE ORIGEM (Backup) ---")
     install_velero(ctx_src)
@@ -379,7 +402,7 @@ def execute_backup_flow(ctx_src):
         return bk
     except SystemExit: print("❌ Backup falhou."); sys.exit(1)
 
-def execute_restore_flow(ctx_dst, bk_name):
+def execute_restore_flow(ctx_dst, bk_name, trust_mode):
     print(f"\n--- 🛬 FASE DESTINO (Restore) ---")
     install_velero(ctx_dst)
     if wait_for_backup_sync(bk_name):
@@ -399,47 +422,47 @@ def main():
     validate_bucket(CONFIG['bucket_name'])
     CONFIG['role_name'] = extract_and_validate_role(CONFIG['role_arn'])
     
-    # 1. Garante permissão na role e bucket
     ensure_role_permissions(CONFIG['role_name'], CONFIG['bucket_name'])
     generate_velero_values(CONFIG['bucket_name'], CONFIG['role_arn'], CONFIG['region'])
 
     ctx_src, ctx_dst = None, None
     oidc_src, oidc_dst = None, None
-    valid_oidcs = []
+    target_oidcs = []
 
     if CONFIG['cluster_src']:
         ctx_src = setup_kube_context(CONFIG['cluster_src'])
         oidc_src = get_cluster_oidc(CONFIG['cluster_src'])
-        valid_oidcs.append(oidc_src)
+        target_oidcs.append(oidc_src)
 
     if CONFIG['cluster_dst']:
         ctx_dst = setup_kube_context(CONFIG['cluster_dst'])
         oidc_dst = get_cluster_oidc(CONFIG['cluster_dst'])
-        valid_oidcs.append(oidc_dst)
+        target_oidcs.append(oidc_dst)
 
-    # 2. Consolidação de Trusts (CLEAN & LEAN)
-    print("\n🔒 [TRUST CLEANUP] Consolidando permissões IAM...")
+    # Lógica de Trust Mode
+    mode = CONFIG['mode']
+    trust_mode = 'replace' if mode == 'FULL_MIGRATION' else 'append'
+
+    print(f"\n🔒 [IAM] Configurando Trust (Mode: {trust_mode.upper()})...")
     
-    # Velero Role:
-    configure_irsa_trust(CONFIG['role_name'], valid_oidcs, "velero", "velero-server")
+    # 1. Configura Role do Velero
+    manage_irsa_trust(CONFIG['role_name'], target_oidcs, "velero", "velero-server", mode=trust_mode)
     
-    # App Roles:
+    # 2. Configura Roles de Aplicação (Se tiver origem)
     if ctx_src:
-        run_pre_flight_irsa(ctx_src, valid_oidcs)
+        run_pre_flight_irsa(ctx_src, target_oidcs, mode=trust_mode)
 
     # 3. Execução
-    mode = CONFIG['mode']
-    
     if mode == 'BACKUP_ONLY':
-        execute_backup_flow(ctx_src)
+        execute_backup_flow(ctx_src, trust_mode)
         
     elif mode == 'RESTORE_ONLY':
-        execute_restore_flow(ctx_dst, CONFIG['restore_backup_name'])
+        execute_restore_flow(ctx_dst, CONFIG['restore_backup_name'], trust_mode)
         
     elif mode == 'FULL_MIGRATION':
         sync_istio_resources(ctx_src, ctx_dst)
-        backup_name = execute_backup_flow(ctx_src)
-        execute_restore_flow(ctx_dst, backup_name)
+        backup_name = execute_backup_flow(ctx_src, trust_mode)
+        execute_restore_flow(ctx_dst, backup_name, trust_mode)
 
     print("\n✅ Processo finalizado.")
 

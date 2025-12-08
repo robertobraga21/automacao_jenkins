@@ -24,7 +24,7 @@ pipeline {
         stage('Executar Migração') {
             steps {
                 withCredentials([usernamePassword(credentialsId: 'aws-migration-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-                    sh 'python3 migracao_jenkins.py'
+                    sh 'python3 -u migracao_jenkins.py'
                 }
             }
         }
