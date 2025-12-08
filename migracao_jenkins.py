@@ -43,10 +43,11 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V58 (Prefix Isolation) ---")
+    print("\n🚀 --- Migração EKS V59 (Trust Logic Restored) ---")
     
     CONFIG['region'] = get_required_env("AWS_REGION")
     CONFIG['mode'] = get_required_env("OPERATION_MODE") 
+    
     CONFIG['bucket_name'] = get_required_env("VELERO_BUCKET_NAME")
     CONFIG['role_arn'] = get_required_env("VELERO_ROLE_ARN")
     
@@ -105,13 +106,13 @@ def setup_kube_context(cluster_name):
     except Exception as e:
         print(f"      ⛔ Erro config cluster: {e}"); sys.exit(1)
 
-# --- 4. PREPARAÇÃO (COM PREFIXO VELERO) ---
+# --- 4. PREPARAÇÃO ---
 def generate_velero_values(bucket, role_arn, region):
     print(f"\n📝 Gerando 'values.yaml' (Prefix: velero)...")
     yaml_content = f"""configuration:
   backupStorageLocation:
     - bucket: {bucket}
-      prefix: velero  # <--- CORREÇÃO AQUI: ISOLA O VELERO NUMA SUBPASTA
+      prefix: velero
       provider: aws
       config:
         region: {region}
@@ -177,30 +178,74 @@ def ensure_role_permissions(role_name, bucket_name):
         print(f"      ✅ Policy aplicada.")
     except Exception as e: print(f"      ⚠️  Falha permissoes: {e}")
 
-# --- 5. LÓGICA CORE ---
-def configure_irsa_trust(role_name, oidcs_list, ns, sa):
-    iam = get_aws_session().client('iam'); sts = get_aws_session().client('sts')
+# --- 5. LÓGICA CORE (TRUST / IRSA) ---
+def configure_irsa_trust(role_name, oidcs_list, ns, sa, mode='append'):
+    """
+    mode='replace': Limpa tudo e deixa SÓ os oidcs passados.
+    mode='append': Mantém o que tem e adiciona os novos se faltar.
+    """
+    iam = get_aws_session().client('iam')
+    sts = get_aws_session().client('sts')
     acc = sts.get_caller_identity()["Account"]
-    new_statements = [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{acc}:root"}, "Action": "sts:AssumeRole"}]
-    for oidc in list(set(oidcs_list)):
-        oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
-        new_statements.append({
-            "Effect": "Allow", "Principal": {"Federated": oidc_arn},
-            "Action": "sts:AssumeRoleWithWebIdentity",
-            "Condition": {"StringEquals": {f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"}}
-        })
-    policy_doc = {"Version": "2012-10-17", "Statement": new_statements}
+    
     try:
-        iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(policy_doc))
-        return True
-    except Exception as e:
-        print(f"      ⛔ Erro Trust Policy: {e}"); return False
+        # Pega policy atual
+        current_policy = iam.get_role(RoleName=role_name)['Role']['AssumeRolePolicyDocument']
+        
+        # Se for REPLACE, começamos do zero apenas com Root
+        if mode == 'replace':
+            new_statements = [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{acc}:root"}, "Action": "sts:AssumeRole"}]
+        else:
+            # Se for APPEND, usamos o que já tem
+            new_statements = current_policy.get('Statement', [])
 
-def run_pre_flight_irsa(ctx, oidcs_list):
-    print(f"\n🕵️  [IRSA] Scan e Consolidação de Aplicações em {ctx}...")
+        # Lista de OIDCs a garantir
+        unique_oidcs = list(set(oidcs_list))
+        updated = False
+
+        for oidc in unique_oidcs:
+            oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
+            
+            # Verifica se já existe
+            exists = False
+            for s in new_statements:
+                if s.get('Principal', {}).get('Federated') == oidc_arn:
+                    cond = s.get('Condition', {}).get('StringEquals', {})
+                    for k, v in cond.items():
+                        if f"{oidc}:sub" in k and v == f"system:serviceaccount:{ns}:{sa}":
+                            exists = True
+                            break
+            
+            if not exists:
+                new_statements.append({
+                    "Effect": "Allow",
+                    "Principal": {"Federated": oidc_arn},
+                    "Action": "sts:AssumeRoleWithWebIdentity",
+                    "Condition": {
+                        "StringEquals": {
+                            f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"
+                        }
+                    }
+                })
+                updated = True
+        
+        if updated or mode == 'replace':
+            policy_doc = {"Version": "2012-10-17", "Statement": new_statements}
+            iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(policy_doc))
+            print(f"      ✅ Policy atualizada (Mode: {mode}).")
+        
+        return True
+        
+    except Exception as e:
+        print(f"      ⛔ Erro Trust Policy ({mode}): {e}")
+        return False
+
+def run_pre_flight_irsa(ctx, oidcs_list, mode):
+    print(f"\n🕵️  [IRSA] Scan de Aplicações em {ctx} (Mode: {mode})...")
     try:
         k8s_config.load_kube_config(config_file=os.environ["KUBECONFIG"], context=ctx)
-        v1 = client.CoreV1Api(); items = v1.list_service_account_for_all_namespaces().items
+        v1 = client.CoreV1Api()
+        items = v1.list_service_account_for_all_namespaces().items
     except: print("   ⚠️  Erro lendo SAs."); return
 
     cnt = 0
@@ -211,9 +256,10 @@ def run_pre_flight_irsa(ctx, oidcs_list):
         if arn:
             r_name = arn.split("/")[-1]
             if r_name == CONFIG['role_name'] or "aws-service-role" in r_name: continue
-            if configure_irsa_trust(r_name, oidcs_list, ns, sa.metadata.name): 
+            
+            if configure_irsa_trust(r_name, oidcs_list, ns, sa.metadata.name, mode=mode): 
                 cnt += 1; time.sleep(0.2)
-    print(f"✅ {cnt} apps consolidadas.")
+    print(f"✅ {cnt} apps processadas.")
 
 # --- 6. ISTIO SYNC ---
 def sanitize_k8s_object(obj):
@@ -233,7 +279,6 @@ def backup_istio_to_s3(src_ctx, backup_name):
     s3 = get_aws_session().client('s3')
     
     try:
-        # Busca no istio-system (onde ficam as configs globais)
         resp = custom_api.list_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices")
         items = resp.get('items', [])
     except Exception as e: print(f"   ⚠️  Erro lendo Istio: {e}"); return
@@ -245,7 +290,6 @@ def backup_istio_to_s3(src_ctx, backup_name):
         vs_name = item['metadata']['name']
         local_path = f"{tmp_dir}/{vs_name}.json"
         with open(local_path, 'w') as f: json.dump(sanitize_k8s_object(item), f)
-        # Salva em pasta separada da do Velero
         s3.upload_file(local_path, CONFIG['bucket_name'], f"istio-artifacts/{backup_name}/{vs_name}.json")
         print(f"   📤 Exportado: {vs_name}")
         count += 1
@@ -274,15 +318,17 @@ def restore_istio_from_s3(dst_ctx, backup_name):
             obj_body = s3.get_object(Bucket=CONFIG['bucket_name'], Key=obj['Key'])['Body'].read().decode('utf-8')
             vs_json = json.loads(obj_body)
             try:
-                # Restaura sempre no istio-system
                 custom_api.create_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices", vs_json)
                 print(f"   ✅ Restaurado: {vs_name}")
             except client.exceptions.ApiException as e:
                 if e.status == 409:
-                    exist = custom_api.get_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices", vs_name)
-                    vs_json['metadata']['resourceVersion'] = exist['metadata']['resourceVersion']
-                    custom_api.replace_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices", vs_name, vs_json)
-                    print(f"   🔄 Atualizado: {vs_name}")
+                    try:
+                        exist = custom_api.get_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices", vs_name)
+                        vs_json['metadata']['resourceVersion'] = exist['metadata']['resourceVersion']
+                        custom_api.replace_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices", vs_name, vs_json)
+                        print(f"   🔄 Atualizado: {vs_name}")
+                    except: print(f"   ❌ Falha update: {vs_name}")
+                else: print(f"   ❌ Falha create: {vs_name}")
     except Exception as e: print(f"   ❌ Erro Istio Restore: {e}")
 
 # --- 7. VELERO CONTROL (DIAGNOSTIC) ---
@@ -333,10 +379,12 @@ def install_velero(context):
     run_shell("kubectl rollout restart deployment velero -n velero", quiet=True)
 
 # --- MAIN FLOWS ---
-def execute_backup_flow(ctx_src, allowed_oidcs):
+def execute_backup_flow(ctx_src, allowed_oidcs, trust_mode):
     bk = f"migracao-{int(time.time())}"
-    configure_irsa_trust(CONFIG['role_name'], allowed_oidcs, "velero", "velero-server")
-    if ctx_src: run_pre_flight_irsa(ctx_src, allowed_oidcs)
+    
+    # Configura Role (Replace ou Append)
+    configure_irsa_trust(CONFIG['role_name'], allowed_oidcs, "velero", "velero-server", mode=trust_mode)
+    if ctx_src: run_pre_flight_irsa(ctx_src, allowed_oidcs, mode=trust_mode)
     
     print(f"\n--- 🚀 FASE ORIGEM (Backup) ---")
     install_velero(ctx_src)
@@ -352,14 +400,17 @@ def execute_backup_flow(ctx_src, allowed_oidcs):
         return bk
     except SystemExit: print("❌ Backup falhou."); sys.exit(1)
 
-def execute_restore_flow(ctx_dst, bk_name, allowed_oidcs):
-    configure_irsa_trust(CONFIG['role_name'], allowed_oidcs, "velero", "velero-server")
+def execute_restore_flow(ctx_dst, bk_name, allowed_oidcs, trust_mode):
+    # Configura Role (Replace ou Append)
+    configure_irsa_trust(CONFIG['role_name'], allowed_oidcs, "velero", "velero-server", mode=trust_mode)
+    
     print(f"\n--- 🛬 FASE DESTINO (Restore) ---")
     install_velero(ctx_dst)
     
     if wait_for_backup_sync(bk_name):
-        print(f"♻️  Restaurando '{bk_name}'...")
+        print(f"♻️  Restaurando Aplicações '{bk_name}'...")
         run_shell(f"velero restore create --from-backup {bk_name} --existing-resource-policy update --exclude-resources {EXCLUDE_RESOURCES} --wait")
+        
         restore_istio_from_s3(ctx_dst, bk_name)
         print("\n🎉 Restore finalizado com sucesso!")
     else: print("\n⛔ Restore abortado."); sys.exit(1)
@@ -379,29 +430,30 @@ def main():
 
     ctx_src, ctx_dst = None, None
     oidc_src, oidc_dst = None, None
-    valid_oidcs = []
+    target_oidcs = []
 
     if CONFIG['cluster_src']:
         ctx_src = setup_kube_context(CONFIG['cluster_src'])
         oidc_src = get_cluster_oidc(CONFIG['cluster_src'])
-        valid_oidcs.append(oidc_src)
+        target_oidcs.append(oidc_src)
 
     if CONFIG['cluster_dst']:
         ctx_dst = setup_kube_context(CONFIG['cluster_dst'])
         oidc_dst = get_cluster_oidc(CONFIG['cluster_dst'])
-        valid_oidcs.append(oidc_dst)
+        target_oidcs.append(oidc_dst)
 
     mode = CONFIG['mode']
+    trust_mode = 'replace' if mode == 'FULL_MIGRATION' else 'append'
     
     if mode == 'BACKUP_ONLY':
-        execute_backup_flow(ctx_src, valid_oidcs)
+        execute_backup_flow(ctx_src, target_oidcs, trust_mode)
         
     elif mode == 'RESTORE_ONLY':
-        execute_restore_flow(ctx_dst, CONFIG['restore_backup_name'], valid_oidcs)
+        execute_restore_flow(ctx_dst, CONFIG['restore_backup_name'], target_oidcs, trust_mode)
         
     elif mode == 'FULL_MIGRATION':
-        bk_name = execute_backup_flow(ctx_src, valid_oidcs)
-        execute_restore_flow(ctx_dst, bk_name, valid_oidcs)
+        bk_name = execute_backup_flow(ctx_src, target_oidcs, trust_mode)
+        execute_restore_flow(ctx_dst, bk_name, target_oidcs, trust_mode)
 
     print("\n✅ Processo finalizado.")
 
