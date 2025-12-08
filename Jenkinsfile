@@ -4,34 +4,31 @@ pipeline {
     }
 
     parameters {
-        choice(name: 'ENV_TYPE', choices: ['DEV', 'HML', 'PRD'], description: 'Ambiente')
+        choice(name: 'OPERATION_MODE', choices: ['FULL_MIGRATION', 'BACKUP_ONLY', 'RESTORE_ONLY'], description: 'Selecione o tipo de operação')
         string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'Região AWS')
         
-        // Campos Obrigatórios - O usuário DEVE preencher
-        string(name: 'CLUSTER_SOURCE_NAME', description: 'Cluster de ORIGEM')
-        string(name: 'CLUSTER_DEST_NAME', description: 'Cluster de DESTINO')
-        string(name: 'VELERO_BUCKET_NAME', description: 'Nome do Bucket S3 (Existente)')
-        string(name: 'VELERO_ROLE_ARN', description: 'ARN da Role IAM (Existente)')
+        string(name: 'CLUSTER_SOURCE_NAME', defaultValue: '', description: 'Cluster ORIGEM (Obrigatório para FULL e BACKUP)')
+        string(name: 'CLUSTER_DEST_NAME', defaultValue: '', description: 'Cluster DESTINO (Obrigatório para FULL e RESTORE)')
         
-        // Opcionais
-        string(name: 'ISTIO_SYNC_MODE', defaultValue: 'all', description: "'all', 'none' ou lista separada por vírgula")
+        string(name: 'BACKUP_NAME_TO_RESTORE', defaultValue: '', description: 'Nome do Backup para restaurar (Apenas p/ RESTORE_ONLY)')
+        
+        string(name: 'VELERO_BUCKET_NAME', description: 'Nome do Bucket S3')
+        string(name: 'VELERO_ROLE_ARN', description: 'ARN da Role IAM do Velero')
+        
+        string(name: 'ISTIO_SYNC_MODE', defaultValue: 'all', description: 'Istio Sync (all/none)')
         booleanParam(name: 'CLEANUP_ENABLED', defaultValue: false, description: 'Limpeza prévia do Velero?')
-        booleanParam(name: 'SKIP_RESTORE', defaultValue: false, description: 'Pular restore? (Apenas Backup)')
     }
 
     environment {
-        // Plugin de Credenciais injeta AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY
-        AWS_CREDS = credentials('aws-migration-creds')
+        AWS_ACCESS_KEY_ID = credentials('aws-migration-creds-usr')
+        AWS_SECRET_ACCESS_KEY = credentials('aws-migration-creds-psw')
     }
 
     stages {
         stage('Executar Migração') {
             steps {
-                script {
-                    // Passa credenciais para o script
-                    withCredentials([usernamePassword(credentialsId: 'aws-migration-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-                        sh 'python3 migracao_jenkins.py'
-                    }
+                withCredentials([usernamePassword(credentialsId: 'aws-migration-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    sh 'python3 migracao_jenkins.py'
                 }
             }
         }
