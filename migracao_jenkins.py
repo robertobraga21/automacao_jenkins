@@ -18,6 +18,7 @@ SYSTEM_NAMESPACES = [
 
 EXCLUDE_RESOURCES = "pods,replicasets,endpoints,endpointslices"
 
+# Mínimo necessário
 VELERO_IAM_POLICY = {
     "Version": "2012-10-17",
     "Statement": [
@@ -64,7 +65,7 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V53 (Consolidated Logic) ---")
+    print("\n🚀 --- Migração EKS V54 (Logic Fixed) ---")
     
     CONFIG['region'] = get_required_env("AWS_REGION")
     CONFIG['mode'] = get_required_env("OPERATION_MODE") 
@@ -168,7 +169,6 @@ def get_cluster_oidc(name):
 
 def ensure_role_permissions(role_name, bucket_name):
     print(f"   🛡️  Blindando permissões na role '{role_name}'...")
-    # Política restrita ao bucket escolhido
     policy_doc = {
         "Version": "2012-10-17",
         "Statement": [
@@ -202,17 +202,23 @@ def ensure_role_permissions(role_name, bucket_name):
 
 def configure_irsa_trust(role_name, oidcs_list, ns, sa):
     """
-    Limpa a policy e adiciona confiança para os OIDCs da lista (Consolidação).
+    Limpa a policy e adiciona confiança APENAS para os OIDCs da lista.
+    Garante que não haja duplicatas.
     """
     iam = get_aws_session().client('iam')
     sts = get_aws_session().client('sts')
     acc = sts.get_caller_identity()["Account"]
     
+    # 1. Base Policy
     new_statements = [
         {"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{acc}:root"}, "Action": "sts:AssumeRole"}
     ]
 
-    for oidc in oidcs_list:
+    # 2. Remove duplicatas da lista de OIDCs (set)
+    unique_oidcs = list(set(oidcs_list))
+
+    # 3. Adiciona permissões estritamente necessárias
+    for oidc in unique_oidcs:
         oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
         new_statements.append({
             "Effect": "Allow",
@@ -224,18 +230,8 @@ def configure_irsa_trust(role_name, oidcs_list, ns, sa):
                 }
             }
         })
-    # Caso especial para o velero-server que as vezes pode ser chamado de velero em versões antigas
-    if sa == "velero-server":
-         # Adiciona compatibilidade para SA 'velero' também, por segurança
-         for oidc in oidcs_list:
-            oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
-            new_statements.append({
-                "Effect": "Allow",
-                "Principal": {"Federated": oidc_arn},
-                "Action": "sts:AssumeRoleWithWebIdentity",
-                "Condition": {"StringEquals": {f"{oidc}:sub": "system:serviceaccount:velero:velero"}}
-            })
 
+    # 4. Reescreve a Policy
     policy_doc = {"Version": "2012-10-17", "Statement": new_statements}
     
     try:
@@ -262,10 +258,10 @@ def run_pre_flight_irsa(ctx, oidcs_list):
             r_name = arn.split("/")[-1]
             if r_name == CONFIG['role_name'] or "aws-service-role" in r_name: continue
             
-            # Aqui está a mágica: Passamos a lista de TODOS os OIDCs (src + dst)
+            # Limpa e atualiza (sem criar duplicatas de legacy)
             if configure_irsa_trust(r_name, oidcs_list, ns, sa.metadata.name): 
                 cnt += 1; time.sleep(0.2)
-    print(f"✅ {cnt} apps consolidadas (Permitindo Origem + Destino).")
+    print(f"✅ {cnt} apps consolidadas.")
 
 # --- 6. ISTIO SYNC ---
 def sanitize_k8s_object(obj):
@@ -341,7 +337,6 @@ def cleanup_velero(context):
     run_shell("helm uninstall velero -n velero", ignore_error=True, quiet=True)
     run_shell("kubectl delete ns velero --timeout=5s --wait=false", ignore_error=True, quiet=True)
     
-    # Loop de espera (Zombie Killer)
     for i in range(20):
         if subprocess.run("kubectl get ns velero", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
             print("      ✅ Limpeza concluída.")
@@ -352,7 +347,6 @@ def cleanup_velero(context):
     print("      ⚠️  Aviso: Namespace ainda consta como Terminating. Tentando prosseguir.")
 
 def install_velero(context):
-    # CLEANUP MANDATÓRIO AGORA
     cleanup_velero(context)
     
     print(f"⚓ [{context}] Instalando Velero...")
@@ -364,7 +358,7 @@ def install_velero(context):
     
     cmd = f"helm upgrade --install velero vmware-tanzu/velero --namespace velero -f values.yaml --reset-values --wait"
     if not run_shell(cmd, quiet=True, ignore_error=True):
-        print("   ❌ Erro Helm. Retry com força bruta...")
+        print("   ❌ Erro Helm. Tentando forçar reinstalação...")
         cleanup_velero(context)
         run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True)
         run_shell(cmd, quiet=True)
@@ -405,9 +399,8 @@ def main():
     validate_bucket(CONFIG['bucket_name'])
     CONFIG['role_name'] = extract_and_validate_role(CONFIG['role_arn'])
     
-    # Permission Enforcer com escopo de Bucket
+    # 1. Garante permissão na role e bucket
     ensure_role_permissions(CONFIG['role_name'], CONFIG['bucket_name'])
-    
     generate_velero_values(CONFIG['bucket_name'], CONFIG['role_arn'], CONFIG['region'])
 
     ctx_src, ctx_dst = None, None
@@ -424,17 +417,17 @@ def main():
         oidc_dst = get_cluster_oidc(CONFIG['cluster_dst'])
         valid_oidcs.append(oidc_dst)
 
-    # 1. CONSOLIDAR TRUST POLICIES (LIMPEZA INICIAL - UMA VEZ SÓ)
+    # 2. Consolidação de Trusts (CLEAN & LEAN)
     print("\n🔒 [TRUST CLEANUP] Consolidando permissões IAM...")
     
-    # Velero Role: Limpa e adiciona apenas os clusters envolvidos (Origem e Destino)
+    # Velero Role:
     configure_irsa_trust(CONFIG['role_name'], valid_oidcs, "velero", "velero-server")
     
-    # App Roles: Se tiver origem, limpa e prepara para ambos
+    # App Roles:
     if ctx_src:
         run_pre_flight_irsa(ctx_src, valid_oidcs)
 
-    # 2. EXECUÇÃO
+    # 3. Execução
     mode = CONFIG['mode']
     
     if mode == 'BACKUP_ONLY':
