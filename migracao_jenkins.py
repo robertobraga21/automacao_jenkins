@@ -64,10 +64,10 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V49 (Final Fix) ---")
+    print("\n🚀 --- Migração EKS V50 (Stable Fix) ---")
     
     CONFIG['region'] = get_required_env("AWS_REGION")
-    CONFIG['mode'] = get_required_env("OPERATION_MODE") # FULL_MIGRATION, BACKUP_ONLY, RESTORE_ONLY
+    CONFIG['mode'] = get_required_env("OPERATION_MODE") 
     
     CONFIG['bucket_name'] = get_required_env("VELERO_BUCKET_NAME")
     CONFIG['role_arn'] = get_required_env("VELERO_ROLE_ARN")
@@ -173,9 +173,35 @@ def ensure_role_permissions(role_name):
         get_aws_session().client('iam').put_role_policy(RoleName=role_name, PolicyName="VeleroPerms", PolicyDocument=json.dumps(VELERO_IAM_POLICY))
     except Exception as e: print(f"      ⚠️  Falha permissoes: {e}")
 
-# --- STRICT OIDC POLICY ---
+# --- 5. LÓGICA CORE (TRUST / IRSA) ---
+
+# Função Genérica de Append (Usada para Velero Setup e Apps)
+def update_trust_policy(role_name, oidc, ns, sa):
+    iam = get_aws_session().client('iam')
+    sts = get_aws_session().client('sts')
+    acc = sts.get_caller_identity()["Account"]
+    oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
+    try:
+        role_data = iam.get_role(RoleName=role_name)
+        pol = role_data['Role']['AssumeRolePolicyDocument']
+        for s in pol['Statement']:
+            if s.get('Principal', {}).get('Federated') == oidc_arn:
+                cond = s.get('Condition', {}).get('StringEquals', {})
+                for k,v in cond.items():
+                    if f"{oidc}:sub" in k and v == f"system:serviceaccount:{ns}:{sa}": return False
+        
+        # print(f"   ➕ Trust: {oidc} -> {role_name}")
+        pol['Statement'].append({
+            "Effect": "Allow", "Principal": {"Federated": oidc_arn}, "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {"StringEquals": {f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"}}
+        })
+        iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(pol))
+        return True
+    except: return False
+
+# Função Estrita de Replace (Usada no Backup/Restore para limpar sujeira)
 def enforce_strict_oidc_policy(role_name, allowed_oidcs):
-    print(f"   🔒 [STRICT OIDC] Atualizando Trust Policy em '{role_name}'...")
+    print(f"   🔒 [STRICT OIDC] Limpando e aplicando Trust Policy em '{role_name}'...")
     iam = get_aws_session().client('iam')
     acc = get_aws_session().client('sts').get_caller_identity()["Account"]
     
@@ -203,31 +229,10 @@ def enforce_strict_oidc_policy(role_name, allowed_oidcs):
     policy_doc = {"Version": "2012-10-17", "Statement": new_statements}
     try:
         iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(policy_doc))
-        print("      ✅ Policy atualizada (Clusters antigos removidos).")
+        print("      ✅ Policy atualizada (Clean).")
         time.sleep(5)
     except Exception as e:
-        print(f"      ⛔ Erro ao atualizar Trust Policy: {e}"); sys.exit(1)
-
-def update_app_irsa_trust(role_name, oidc, ns, sa):
-    iam = get_aws_session().client('iam')
-    acc = get_aws_session().client('sts').get_caller_identity()["Account"]
-    oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
-    try:
-        role_data = iam.get_role(RoleName=role_name)
-        pol = role_data['Role']['AssumeRolePolicyDocument']
-        for s in pol['Statement']:
-            if s.get('Principal', {}).get('Federated') == oidc_arn:
-                cond = s.get('Condition', {}).get('StringEquals', {})
-                for k,v in cond.items():
-                    if f"{oidc}:sub" in k and v == f"system:serviceaccount:{ns}:{sa}": return False
-        
-        pol['Statement'].append({
-            "Effect": "Allow", "Principal": {"Federated": oidc_arn}, "Action": "sts:AssumeRoleWithWebIdentity",
-            "Condition": {"StringEquals": {f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"}}
-        })
-        iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(pol))
-        return True
-    except: return False
+        print(f"      ⛔ Erro Strict Policy: {e}"); sys.exit(1)
 
 def run_pre_flight_irsa(ctx, dest_oidc):
     print(f"\n🕵️  [IRSA] Scan de Aplicações em {ctx}...")
@@ -245,11 +250,12 @@ def run_pre_flight_irsa(ctx, dest_oidc):
         if arn:
             r_name = arn.split("/")[-1]
             if r_name == CONFIG['role_name'] or "aws-service-role" in r_name: continue
-            if update_app_irsa_trust(r_name, dest_oidc, ns, sa.metadata.name): 
+            # Usa a função genérica que agora existe!
+            if update_trust_policy(r_name, dest_oidc, ns, sa.metadata.name): 
                 cnt += 1; time.sleep(0.2)
     print(f"✅ {cnt} apps preparadas.")
 
-# --- 5. ISTIO SYNC ---
+# --- 6. ISTIO SYNC ---
 def sanitize_k8s_object(obj):
     if 'metadata' in obj:
         for field in ['resourceVersion', 'uid', 'creationTimestamp', 'generation', 'ownerReferences', 'managedFields']:
@@ -303,7 +309,7 @@ def sync_istio_resources(src_ctx, dst_ctx):
                 except: print(f"    ❌ Falha update: {name}")
             else: print(f"    ❌ Falha create: {name}")
 
-# --- 6. VELERO CONTROL ---
+# --- 7. VELERO CONTROL ---
 def wait_for_backup_sync(bk):
     print(f"⏳ Aguardando sync do backup '{bk}' no destino...")
     for i in range(30):
@@ -395,7 +401,7 @@ def main():
         execute_restore_flow(ctx_dst, CONFIG['restore_backup_name'], allowed_oidcs)
         
     elif mode == 'FULL_MIGRATION':
-        # Trust temporário para ler apps da origem
+        # Aqui estava o erro: agora chamamos update_trust_policy que foi definida acima
         update_trust_policy(CONFIG['role_name'], oidc_src, "velero", "velero-server") 
         run_pre_flight_irsa(ctx_src, oidc_dst)
         sync_istio_resources(ctx_src, ctx_dst)
